@@ -1,118 +1,384 @@
-import express from 'express';
-import { createServer } from 'http';
-import { WebSocketServer } from 'ws';
-import cors from 'cors';
-import cookieParser from 'cookie-parser';
-import mongoose from 'mongoose';
-import dotenv from 'dotenv';
-import cron from 'node-cron';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import { useEffect, useState } from 'react';
+import * as api from './api';
+import { wsClient } from './ws';
+import { User, IncomingCall } from './types';
+import { ThemeName, ThemeProvider, useTheme } from './context/ThemeContext';
 
-// Routes
-import authRoutes from './routes/auth.routes.js';
-import userRoutes from './routes/user.routes.js';
-import messageRoutes from './routes/message.routes.js';
-import channelRoutes from './routes/channel.routes.js';
-import adminRoutes from './routes/admin.routes.js';
-import uploadRoutes from './routes/upload.routes.js';
-import battleRoutes from './routes/battle.routes.js';
+import SplashScreen from './components/SplashScreen';
+import DeviceSelect from './components/DeviceSelect';
+import ThemePicker from './components/ThemePicker';
+import EmojiPicker from './components/EmojiPicker';
+import AuthScreen from './components/AuthScreen';
+import ChannelSubscribe from './components/ChannelSubscribe';
+import Sidebar from './components/Sidebar';
+import ChatWindow from './components/ChatWindow';
+import Error526 from './components/Error526';
+import EmojiBattle from './components/EmojiBattle';
 
-// WebSocket handler
-import { setupWebSocket } from './ws/wsHandler.js';
+// Cookie helpers — без localStorage!
+function setCookie(name: string, value: string, days: number) {
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  document.cookie = `${name}=${value};expires=${d.toUTCString()};path=/;SameSite=None;Secure`;
+}
 
-// Services
-import { resetEmojiBattle } from './services/emojiBattle.service.js';
-import { createAdminUser, createBotUser, createDefaultChannels } from './services/init.service.js';
+function getCookie(name: string): string | null {
+  const m = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+  return m ? m[2] : null;
+}
 
-dotenv.config();
+function delCookie(name: string) {
+  document.cookie = `${name}=;expires=Thu, 01 Jan 1970 00:00:00 UTC;path=/`;
+}
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+type Screen =
+  | 'splash'
+  | 'device-select'
+  | 'theme-pick'
+  | 'auth'
+  | 'emoji-pick'
+  | 'channel-subscribe'
+  | 'main'
+  | 'error-526';
 
-const app = express();
-const server = createServer(app);
+// Внутренний компонент с доступом к теме
+function AppContent() {
+  const { theme, setTheme } = useTheme();
+  const [screen, setScreen] = useState<Screen>('splash');
+  const [user, setUser] = useState<User | null>(null);
+  const [token, setToken] = useState<string | null>(null);
 
-// CORS настройки
-const corsOptions = {
-  origin: [
-    'http://localhost:5173',
-    'http://localhost:3000',
-    'https://wintozoversion2final.vercel.app',
-    /\.vercel\.app$/
-  ],
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Cookie'],
-};
+  // Состояние регистрации
+  const [selectedDevice, setSelectedDevice] = useState('desktop');
+  const [selectedTheme, setSelectedTheme] = useState<ThemeName>('dark');
+  const [selectedEmoji, setSelectedEmoji] = useState('');
 
-app.use(cors(corsOptions));
-app.use(express.json());
-app.use(cookieParser());
+  // Состояние чата
+  const [selectedUserId, setSelectedUserId] = useState<number | null>(null);
+  const [selectedUsername, setSelectedUsername] = useState('');
 
-// Статические файлы (uploads)
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+  // Звонки
+  const [incomingCall, setIncomingCall] = useState<IncomingCall | null>(null);
 
-// API Routes
-app.use('/api/auth', authRoutes);
-app.use('/api/users', userRoutes);
-app.use('/api/messages', messageRoutes);
-app.use('/api/channels', channelRoutes);
-app.use('/api/admin', adminRoutes);
-app.use('/api/upload', uploadRoutes);
-app.use('/api/emoji-battle', battleRoutes);
+  // Битва эмодзи
+  const [showBattle, setShowBattle] = useState(false);
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
+  // Ошибка сервера
+  const [serverError, setServerError] = useState(false);
 
-// Root
-app.get('/', (req, res) => {
-  res.json({ 
-    name: 'Wintozo Messenger API',
-    version: '2.0.0',
-    status: 'running'
-  });
-});
+  // При загрузке: проверка сессии
+  useEffect(() => {
+    const savedToken = getCookie('wtoken');
+    if (savedToken) {
+      api.setToken(savedToken);
+      setToken(savedToken);
+      api.getMe()
+        .then((data) => {
+          const u = data.user as User;
+          setUser(u);
+          // Применяем тему пользователя
+          if (u.theme) {
+            setTheme(u.theme as ThemeName);
+          }
+          setScreen('main');
+          connectWS(savedToken);
+        })
+        .catch(() => {
+          delCookie('wtoken');
+          setTimeout(() => setScreen('device-select'), 2000);
+        });
+    } else {
+      // Новый пользователь
+      setTimeout(() => setScreen('device-select'), 2200);
+    }
+  }, []);
 
-// WebSocket server
-const wss = new WebSocketServer({ server });
-setupWebSocket(wss);
+  const connectWS = (t: string) => {
+    wsClient.connect(t);
+    wsClient.onMessage((msg) => {
+      if (msg.type === 'call_incoming') {
+        setIncomingCall(msg);
+      }
+      if (msg.type === 'kicked') {
+        handleLogout();
+      }
+      if (msg.type === 'ws_error') {
+        setServerError(true);
+      }
+      if (msg.type === 'connected' || msg.type === 'auth_success') {
+        setServerError(false);
+      }
+    });
+  };
 
-// MongoDB подключение
-const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/wintozo';
+  // Успешная авторизация
+  const handleAuthSuccess = (u: User, tok: string, isNew: boolean) => {
+    setUser(u);
+    setToken(tok);
+    setCookie('wtoken', tok, 30);
 
-mongoose.connect(MONGO_URI)
-  .then(async () => {
-    console.log('✅ MongoDB connected');
-    
-    // Создаём Admin, Bot и каналы при первом запуске
-    await createAdminUser();
-    await createBotUser();
-    await createDefaultChannels();
-  })
-  .catch(err => {
-    console.error('❌ MongoDB connection error:', err);
-  });
+    // Применяем выбранную тему
+    setTheme(selectedTheme);
 
-// Cron: сброс битвы эмодзи каждую неделю (воскресенье 23:59)
-cron.schedule('59 23 * * 0', async () => {
-  console.log('🔄 Resetting Emoji Battle...');
-  await resetEmojiBattle();
-});
+    if (isNew) {
+      setScreen('emoji-pick');
+    } else {
+      connectWS(tok);
+      setScreen('main');
+    }
+  };
 
-// Error handler
-app.use((err, req, res, next) => {
-  console.error('Error:', err);
-  res.status(err.status || 500).json({ 
-    error: err.message || 'Internal Server Error' 
-  });
-});
+  const handleEmojiSelect = async (emoji: string) => {
+    setSelectedEmoji(emoji);
+    // Эмодзи уже сохранён при регистрации, просто переходим дальше
+    setUser((u) => u ? { ...u, emoji } : u);
+    if (token) connectWS(token);
+    setScreen('channel-subscribe');
+  };
 
-const PORT = process.env.PORT || 3001;
+  const handleChannelSubscribeDone = () => {
+    setScreen('main');
+  };
 
-server.listen(PORT, () => {
-  console.log(`🚀 Wintozo Server running on port ${PORT}`);
-  console.log(`📡 WebSocket ready`);
-});
+  const handleLogout = async () => {
+    wsClient.disconnect();
+    delCookie('wtoken');
+    api.setToken(null);
+    setUser(null);
+    setToken(null);
+    setSelectedUserId(null);
+    setScreen('device-select');
+  };
+
+  const handleSelectUser = (id: number, username: string) => {
+    setSelectedUserId(id);
+    setSelectedUsername(username);
+  };
+
+  const handleRetry = () => {
+    setServerError(false);
+    window.location.reload();
+  };
+
+  // Рендер экранов
+  if (serverError && screen === 'main') {
+    return <Error526 onRetry={handleRetry} />;
+  }
+
+  if (screen === 'splash') {
+    return <SplashScreen />;
+  }
+
+  if (screen === 'device-select') {
+    return (
+      <DeviceSelect
+        onSelect={(device) => {
+          setSelectedDevice(device);
+          setScreen('theme-pick');
+        }}
+      />
+    );
+  }
+
+  if (screen === 'theme-pick') {
+    return (
+      <ThemePicker
+        current={selectedTheme}
+        onSelect={(themeName) => {
+          setSelectedTheme(themeName);
+          setTheme(themeName);
+          setScreen('auth');
+        }}
+      />
+    );
+  }
+
+  if (screen === 'auth') {
+    return (
+      <AuthScreen
+        onSuccess={handleAuthSuccess}
+        selectedEmoji={selectedEmoji}
+        selectedTheme={selectedTheme}
+        selectedDevice={selectedDevice}
+      />
+    );
+  }
+
+  if (screen === 'emoji-pick') {
+    return <EmojiPicker onSelect={handleEmojiSelect} />;
+  }
+
+  if (screen === 'channel-subscribe') {
+    return <ChannelSubscribe onDone={handleChannelSubscribeDone} />;
+  }
+
+  if (screen === 'main' && user) {
+    return (
+      <div style={{
+        display: 'flex',
+        width: '100vw',
+        height: '100vh',
+        overflow: 'hidden',
+        fontFamily: "'Segoe UI', sans-serif",
+        background: theme.bg,
+        transition: 'background 0.4s ease',
+      }}>
+        <Sidebar
+          user={user}
+          selectedUserId={selectedUserId}
+          onSelectUser={handleSelectUser}
+          onLogout={handleLogout}
+        />
+
+        <div style={{
+          flex: 1,
+          display: 'flex',
+          flexDirection: 'column',
+          overflow: 'hidden',
+        }}>
+          {selectedUserId !== null ? (
+            <ChatWindow
+              user={user}
+              targetUserId={selectedUserId}
+              targetUsername={selectedUsername}
+              incomingCall={incomingCall}
+              onCallHandled={() => setIncomingCall(null)}
+            />
+          ) : (
+            <EmptyChat user={user} onShowBattle={() => setShowBattle(true)} />
+          )}
+        </div>
+
+        {showBattle && <EmojiBattle onClose={() => setShowBattle(false)} />}
+      </div>
+    );
+  }
+
+  return <SplashScreen />;
+}
+
+// Пустой чат
+function EmptyChat({ user, onShowBattle }: { user: User; onShowBattle: () => void }) {
+  const { theme } = useTheme();
+
+  return (
+    <div style={{
+      flex: 1,
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      background: theme.bg,
+      flexDirection: 'column',
+      gap: 0,
+      transition: 'background 0.4s ease',
+    }}>
+      {/* Логотип */}
+      <div style={{
+        width: 100,
+        height: 100,
+        borderRadius: 28,
+        background: theme.gradient,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        fontSize: 60,
+        fontWeight: 900,
+        color: '#fff',
+        boxShadow: theme.glow,
+        marginBottom: 24,
+        animation: 'float 3s ease-in-out infinite',
+      }}>
+        W
+      </div>
+
+      <h2 style={{
+        fontSize: 28,
+        fontWeight: 800,
+        background: theme.gradientText,
+        WebkitBackgroundClip: 'text',
+        WebkitTextFillColor: 'transparent',
+        marginBottom: 8,
+      }}>
+        Wintozo
+      </h2>
+
+      <p style={{
+        color: theme.textMuted,
+        fontSize: 14,
+        marginBottom: 32,
+      }}>
+        Выбери чат чтобы начать общение
+      </p>
+
+      <button
+        onClick={onShowBattle}
+        style={{
+          padding: '14px 32px',
+          borderRadius: 14,
+          border: `1px solid ${theme.border}`,
+          background: theme.button,
+          color: theme.text,
+          cursor: 'pointer',
+          fontSize: 15,
+          fontFamily: 'inherit',
+          fontWeight: 600,
+          display: 'flex',
+          alignItems: 'center',
+          gap: 10,
+          transition: 'all 0.25s ease',
+        }}
+      >
+        ⚔️ Битва Эмодзи
+      </button>
+
+      {user.role === 'admin' && (
+        <div style={{
+          marginTop: 24,
+          padding: '16px 24px',
+          borderRadius: 14,
+          background: 'rgba(251,191,36,0.1)',
+          border: '1px solid rgba(251,191,36,0.3)',
+          color: '#fbbf24',
+          fontSize: 14,
+          textAlign: 'center',
+          lineHeight: 1.6,
+        }}>
+          👑 Ты Администратор<br />
+          <span style={{ color: theme.textMuted, fontSize: 12 }}>
+            Напиши /cmd в чате с Wintozo Bot для консоли
+          </span>
+        </div>
+      )}
+
+      {user.pro && (
+        <div style={{
+          marginTop: 16,
+          padding: '12px 20px',
+          borderRadius: 12,
+          background: 'rgba(251,191,36,0.08)',
+          border: '1px solid rgba(251,191,36,0.2)',
+          color: '#fbbf24',
+          fontSize: 13,
+        }}>
+          💎 Wintozo Pro активна
+        </div>
+      )}
+
+      <style>{`
+        @keyframes float {
+          0%, 100% { transform: translateY(0); }
+          50% { transform: translateY(-10px); }
+        }
+      `}</style>
+    </div>
+  );
+}
+
+// Главный компонент с провайдером темы
+export default function App() {
+  return (
+    <ThemeProvider initialTheme="dark">
+      <AppContent />
+    </ThemeProvider>
+  );
+}
