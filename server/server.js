@@ -733,4 +733,18 @@ function broadcastToUser(userId, data) {
 
 function broadcastToChannel(channelId, data) {
   const channels = loadData('channels');
-  const channel =
+  const channel = channels.find(c => c.id === channelId);
+  
+  if (channel) {
+    channel.subscribers.forEach(userId => {
+      broadcastToUser(userId, data);
+    });
+  }
+}
+
+// ============ ЗАПУСК ============
+initData();
+
+server.listen(PORT, () => {
+  console.log(`Сервер запущен на порту ${PORT}`);
+});
